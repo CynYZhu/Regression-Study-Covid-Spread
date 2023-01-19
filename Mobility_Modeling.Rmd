@@ -1,0 +1,972 @@
+---
+title: "Lab 2 - Regression to Study the spread of COVID-19"
+author: 'w203: Statistics for Data Science - Team Flu-Fighters Adi, Anders, Cynthia,
+  Zixi'
+output: pdf_document
+---
+
+```{r Load packages, echo = FALSE, warning = FALSE, message = FALSE, include=FALSE} 
+library(haven)
+library(knitr)
+library(hash)
+library(glue)
+library(plyr)
+library(tidyverse)
+library(sandwich)
+library(lmtest)
+library(car)
+library(corrplot)
+library(magrittr)
+library(lubridate)
+library(stargazer)
+library(mltools)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+library(ggcorrplot)
+require(gridExtra)
+theme_set(theme_minimal())
+knitr::opts_chunk$set(dpi = 300)
+options(tinytex.verbose = TRUE)
+```
+
+```{r Establishing Covid Window, echo = FALSE, warning = FALSE, message = FALSE}
+#Define Start and end windows. These will be used to derive variables and filter data
+start_window = "2020-02-15" # -> 2/15/2020
+end_window = "2020-06-30"
+```
+
+```{r Import COVID data, echo = FALSE, warning = FALSE, message = FALSE }
+#Read in Covid Dataset
+data <- read.csv(file = 'data/United_States_COVID-19_Cases_and_Deaths_by_State_over_Time.csv')
+names(data)[names(data) == 'submission_date'] <- 'date'
+#Convert metrics to numeric and date
+data$tot_cases = as.numeric(gsub(",","",data$tot_cases))
+data$tot_death = as.numeric(gsub(",","",data$tot_death))
+data$date <- as.Date(data$date, format = "%m/%d/%Y")
+#order by date
+data <-data[order(data$date),]
+```
+
+```{r Load Mobility & policy data, echo = FALSE, warning = FALSE, message = FALSE}
+#Read in Mobility data
+mobility_20 <- read.csv(file = 'data/2020_US_Region_Mobility_Report.csv', stringsAsFactors=FALSE)
+mobility_21 <- read.csv(file = 'data/2021_US_Region_Mobility_Report.csv', stringsAsFactors=FALSE)
+mobility_data <- rbind(mobility_20, mobility_21)
+mobility_data$date <- as.Date(mobility_data$date)
+
+mobility_df <- data.frame()
+COVID_df <- data.frame()
+
+for(state_name in unique(data$state)){
+  state_mobility <- subset(mobility_data, iso_3166_2_code == glue('US-{state_name}'))
+  mobility_df <- rbind(mobility_df, state_mobility) 
+  state_COVID <- subset(data, state == state_name)
+  #state_COVID <- subset(state_COVID, tot_cases >= 0)
+  #state_COVID$COVID_period <- state_COVID$date - state_COVID$date[1]
+  state_COVID$COVID_flag <- ifelse(state_COVID$tot_cases > 0, 1, 0)
+  state_COVID$log_tot_cases <- log(state_COVID$tot_cases)  
+  COVID_df <- rbind(COVID_df, state_COVID)}
+
+#Create subset of Covid and mobility data 
+COVID_df <- subset(COVID_df, select = c(state,
+                                        new_case,
+                                        date,
+                                        tot_cases,
+                                        tot_death,
+                                        COVID_flag,
+                                        log_tot_cases))
+mobility_df <- subset(mobility_df, select=c(iso_3166_2_code, 
+                                            date,
+                                            retail_and_recreation_percent_change_from_baseline,
+                                            grocery_and_pharmacy_percent_change_from_baseline,
+                                            parks_percent_change_from_baseline,
+                                            transit_stations_percent_change_from_baseline,
+                                            workplaces_percent_change_from_baseline,
+                                            residential_percent_change_from_baseline))
+
+mobility_df$iso_3166_2_code <- gsub("US-","",as.character(mobility_df$iso_3166_2_code))
+names(mobility_df)[names(mobility_df) == 'iso_3166_2_code'] <- 'state'
+mobility_df$date <- as.Date(mobility_df$date)
+
+
+input_df <- merge(x = COVID_df, y = mobility_df, by = c("state","date"))
+
+#Rename mobility columns
+names(input_df)[names(input_df) == 'parks_percent_change_from_baseline'] <- 'Mob_parks'
+names(input_df)[names(input_df) == 'residential_percent_change_from_baseline'] <- 'Mob_residential'
+names(input_df)[names(input_df) == 'retail_and_recreation_percent_change_from_baseline'] <- 'Mob_retail_and_recreation'
+names(input_df)[names(input_df) == 'grocery_and_pharmacy_percent_change_from_baseline'] <- 'Mob_grocery_and_pharmacy'
+names(input_df)[names(input_df) == 'workplaces_percent_change_from_baseline'] <- 'Mob_workplaces'
+names(input_df)[names(input_df) == 'transit_stations_percent_change_from_baseline'] <- 'Mob_transit_stations'
+```
+
+```{r Load Face Mask and stay at home dates, state_char full data set as df, echo = FALSE, warning = FALSE, message = FALSE}
+#Read in Policy and State Characteristic data
+face_mask <- read.csv(file = "data/COVID-19_US_state_policy_database_(CUSP)_Face_Masks.csv")
+stay_at_home <- read.csv(file = "data/COVID-19_US_state_policy_database_(CUSP)_Stay_at_Home.csv")
+state_char <- read.csv(file="data/COVID-19_US_state_policy_database-State_Characteristics.csv")
+
+# face mask df，rename variables
+face_mask_df <- face_mask %>%
+  select(State.Abbreviation, Public.face.mask.mandate, End.face.mask.mandate) %>%
+  rename(state = State.Abbreviation,
+         start_mask_mandate = Public.face.mask.mandate,
+         end_mask_mandate = End.face.mask.mandate)
+# Stay at home df, rename variables
+stay_at_home_df <- stay_at_home %>%
+  select(State.Abbreviation, Stay.at.home.shelter.in.place, End.stay.at.home.shelter.in.place) %>%
+  rename(state = State.Abbreviation,
+         start_stay_at_home = Stay.at.home.shelter.in.place,
+         end_stay_at_home = End.stay.at.home.shelter.in.place)
+
+for(row in 1:nrow(stay_at_home_df)){
+  if (stay_at_home_df[row,'start_stay_at_home'] == 0) 
+    {stay_at_home_df[row,'end_stay_at_home'] <- 0  }}
+
+# state characteristics df, rename variables
+state_char_df <- state_char %>%
+  rename(state = State.Abbreviation,
+         ppl_density = Population.density.per.square.mile,
+         ppl_2018 = Population.2018,
+         all_cause_death_2018 = All.cause.deaths.2018,
+         fips_code = State.FIPS.Code) %>%
+  mutate(ppl_density_at_risk = Percent.at.risk.for.serious.illness.due.to.COVID * ppl_2018 / Square.Miles) %>% 
+  select(state, fips_code, ppl_density, ppl_2018, ppl_density_at_risk, all_cause_death_2018)
+
+# merge full COVID, full mobility, face mask, stay at home, state characteristic as df
+df <- full_join(x = input_df, y = state_char_df, by = c("state"))
+df <- full_join(x = df, y = face_mask_df, by = c("state"))
+df <- full_join(x = df, y = stay_at_home_df, by = c("state"))
+# narrow down to the predefined time frame
+df <- subset(df, date >= as.Date(start_window) & date <= as.Date(end_window))
+```
+
+```{r Calculate Covid cases and created Covid_cases_df, echo = FALSE, warning = FALSE, message = FALSE}
+#Calculate Covid cases and log of cases
+COVID_cases_df <- data.frame()
+COVID_cases_df <- ddply(df, .(state), summarize, COVID_duration = sum(COVID_flag), min_cases = min(tot_cases), max_cases = max(tot_cases))
+COVID_cases_df$COVID_increase <- COVID_cases_df$max_cases - COVID_cases_df$min_cases
+COVID_cases_df <- subset(COVID_cases_df, select = c(state, COVID_duration, COVID_increase))
+COVID_cases_df$log_COVID_increase <- log(COVID_cases_df$COVID_increase)
+```
+
+```{r Change mandates into binary still df, echo = FALSE, warning = FALSE, message = FALSE}
+# format dates
+df$start_mask_mandate <- as.Date(df$start_mask_mandate, format = "%m/%d/%Y")
+df$end_mask_mandate <- as.Date(df$end_mask_mandate, format = "%m/%d/%Y")
+df$start_stay_at_home <- as.Date(df$start_stay_at_home, format = "%m/%d/%Y")
+df$end_stay_at_home <- as.Date(df$end_stay_at_home, format = "%m/%d/%Y")
+
+# if no end date, then replace with very last date of the data set 
+df$end_mask_mandate[is.na(df$end_mask_mandate)] <- "2021-03-23"
+df$end_stay_at_home[is.na(df$end_stay_at_home)] <- "2021-03-23"
+
+# if date < start, then 0, start < date < end, then 1, end<start, then 0
+df$mask_mandate <- ifelse(df$date %within% interval(df$start_mask_mandate, df$end_mask_mandate), 1, 0)
+df$stay_at_home <- ifelse(df$date %within% interval(df$start_stay_at_home, df$end_stay_at_home), 1, 0)
+
+# subset to holidays 
+df_holiday <- df[df$date >= start_window & df$date <= as.Date(end_window),]
+
+mask_mandate_df <- aggregate(df_holiday$mask_mandate ~ state, df_holiday, sum)
+names(mask_mandate_df)[names(mask_mandate_df) == 'df_holiday$mask_mandate'] <- 'days_w_mask_mandates'
+
+stay_at_home_df <- aggregate(df_holiday$stay_at_home ~ state, df_holiday, sum)
+names(stay_at_home_df)[names(stay_at_home_df) == 'df_holiday$stay_at_home'] <- 'days_w_stay_home_order'
+```
+
+```{r Average mobility categories between 2020-11-01 and 2021-01-31 mob_avg_df, echo = FALSE, warning = FALSE, message = FALSE}
+#Create mobility average dataframe
+mob_avg_df <- data.frame()
+df_period <- df[df$date >= start_window & df$date <= as.Date(end_window),]
+
+mob_avg_df <- aggregate(df_period$Mob_retail_and_recreation ~ state, df_holiday, mean)
+mob_avg_df$mob_parks_avg <- aggregate(df_period$Mob_parks ~ state, df_period, mean)[,2]
+mob_avg_df$mob_residential_avg <- aggregate(df_period$Mob_residential ~ state, df_period, mean)[,2]
+mob_avg_df$mob_grocery_and_pharmacys_avg <- aggregate(df_period$Mob_grocery_and_pharmacy ~ state, df_period, mean)[,2]
+mob_avg_df$mob_workplaces_avg <- aggregate(df_period$Mob_workplaces ~ state, df_period, mean)[,2]
+mob_avg_df$mobs_transit_stations_avg <- aggregate(df_period$Mob_transit_stations ~ state, df_period, mean)[,2]
+
+names(mob_avg_df)[names(mob_avg_df) == 'df_period$Mob_retail_and_recreation'] <- 'mob_retail_and_recreation_avg'
+#mob_avg_df
+```
+
+```{r Add state census data and calculate state census population data, echo = FALSE, warning = FALSE, message = FALSE}
+#load cesnsus dataset
+df_state_census <- read.csv(file = 'data/state_census.csv')
+#group age buckets and get percent of total population
+df_state_census <- df_state_census %>%
+                            mutate(#Create age categories
+                                    male_0_34 = male_under_5 + 
+                                                male_5_to_9 +
+                                                male_10_to_14 + 
+                                                male_15_to_17 +
+                                                male_18_to_19 + 
+                                                male_20 + 
+                                                male_21 + 
+                                                male_22_to_24 + 
+                                                male_25_to_29 + 
+                                                male_30_to_34,
+                                    male_35_65 =  male_35_to_39 + 
+                                                  male_40_to_44 + 
+                                                  male_45_to_49 + 
+                                                  male_50_to_54 + 
+                                                  male_55_to_59 + 
+                                                  male_60_to_61 + 
+                                                  male_62_to_64,
+                                    male_greater_65 =   male_65_to_66 + 
+                                                        male_67_to_69 +
+                                                        male_70_to_74 +
+                                                        male_75_to_79 + 
+                                                        male_80_to_84 + 
+                                                        male_85_and_over,
+                                    #female second categories
+                                    female_0_34 = female_under_5 + 
+                                                  female_5_to_9 +
+                                                  female_10_to_14 + 
+                                                  female_15_to_17 +
+                                                  female_18_to_19 + 
+                                                  female_20 + 
+                                                  female_21 + 
+                                                  female_22_to_24 + 
+                                                  female_25_to_29 + 
+                                                  female_30_to_34,
+                                    female_35_65 =  female_35_to_39 + 
+                                                    female_40_to_44 + 
+                                                    female_45_to_49 + 
+                                                    female_50_to_54 + 
+                                                    female_55_to_59 + 
+                                                    female_60_to_61 + 
+                                                    female_62_to_64,
+                                   female_greater_65 =  female_65_to_66 + 
+                                                        female_67_to_69 +
+                                                        female_70_to_74 +
+                                                        female_75_to_79 + 
+                                                        female_80_to_84 + 
+                                                        female_85_and_over,
+                                   
+                                   age_0_34_pct = (female_0_34 + male_0_34) / total_pop,
+                                   age_35_65_pct = (female_35_65 + male_35_65) / total_pop,
+                                   age_65_greater_pct = (female_greater_65 + male_greater_65) / total_pop,
+                                   
+                                    #Additional Demographic Metrics 
+                                    married_households_pct= married_households / households,
+                                    nonfamily_households_pct = nonfamily_households / households,
+                                    family_households_pct = family_households /households,
+                                    poverty_pct = poverty / total_pop,
+                                    black_pop_pct = black_pop / total_pop,
+                                    asian_pop_pct = asian_pop / total_pop,
+                                    hispanic_pop_pct = hispanic_pop / total_pop,
+                                    white_pop_pct = white_pop / total_pop,
+                                    minority_pop_pct = (black_pop + hispanic_pop + asian_pop+	other_race_pop) / total_pop,
+                                    minority_pop_pct_at_risk = (black_pop + hispanic_pop +	other_race_pop) / total_pop,
+                                    pop_never_married_pct = pop_never_married / total_pop,
+                                    pop_determined_poverty_status_pct = pop_determined_poverty_status / total_pop)
+
+#Create Subset of Census data
+df_state_census_subset <- df_state_census %>% select(geo_id, total_pop,
+                                                     households,
+                                                     median_age,
+                                                     age_0_34_pct,
+                                                     age_35_65_pct,
+                                                     age_65_greater_pct,
+                                                     median_income, 
+                                                     poverty_pct,
+                                                     married_households_pct,
+                                                     family_households_pct,
+                                                     nonfamily_households_pct,
+                                                     black_pop_pct,
+                                                     asian_pop_pct,
+                                                     hispanic_pop_pct,
+                                                     white_pop_pct,
+                                                     minority_pop_pct,
+                                                     pop_never_married_pct,
+                                                     pop_determined_poverty_status_pct,
+                                                     minority_pop_pct_at_risk)
+```
+
+```{r Read in Covid Testing data, echo = FALSE, warning = FALSE, message = FALSE}
+#Additional analysis around impact of number of tests
+df_tests_conducted <- read.csv(file = 'data/total_tests_6_30.csv')
+df_tests_conducted_subset <- df_tests_conducted %>% select(state, totalTestResults)
+
+```
+
+```{r Population urban and rural, echo = FALSE, warning = FALSE, message = FALSE}
+#Read in Census Urban and Rural Data
+pop_urban_rural <- read.csv(file = "data/PctUrbanRural_State.csv")
+pop_urban_rural_subset <- pop_urban_rural %>% select(STATE, POPPCT_URBAN, POPPCT_RURAL)
+names(pop_urban_rural_subset)[names(pop_urban_rural_subset) == 'POPPCT_URBAN'] <- 'Pop_Urban_pct'
+names(pop_urban_rural_subset)[names(pop_urban_rural_subset) == 'POPPCT_RURAL'] <- 'Pop_Rural_pct'
+```
+
+```{r Load state_region, echo = FALSE, warning = FALSE, message = FALSE}
+#Load in region dataset
+state_region <- read.csv(file = "data/state_region.csv")
+state_region$Region <- as.factor(state_region$Region)
+#One Hot Encode Columns
+state_region_subset <- state_region %>% select(State, Region)
+state_region_one_hot <- one_hot(as.data.table(state_region_subset))
+```
+
+```{r Merge all datasets to create final_df, echo = FALSE, warning = FALSE, message = FALSE}
+#merge state_char with state_census data on fips cod
+state_char_and_census_df <- merge(x = state_char_df,
+                                  y = df_state_census_subset,
+                                  by.x = "fips_code",
+                                  by.y = "geo_id")
+state_char_and_census_df <- merge(x = state_char_and_census_df, 
+                                  y = state_region_one_hot,
+                                  by.x = "fips_code",
+                                  by.y = "State")
+state_char_and_census_df <- merge(x = state_char_and_census_df, 
+                                  y = pop_urban_rural_subset,
+                                  by.x = "fips_code",
+                                  by.y = "STATE")
+final_df <- full_join(x = mask_mandate_df,
+                      y = stay_at_home_df, 
+                      by = c("state"))
+final_df <- full_join(x = final_df,
+                      y = state_char_and_census_df,
+                      by = c("state"))
+final_df <- left_join(x = final_df,
+                      y = df_tests_conducted_subset,
+                      by = c("state"))
+final_df <- full_join(x = final_df,
+                      y = mob_avg_df,
+                      by = c("state"))
+final_df <- full_join(x = final_df,
+                      y = COVID_cases_df,
+                      by = c("state"))
+
+# fill na for days_w_stay_home_order
+final_df$days_w_stay_home_order[is.na(final_df$days_w_stay_home_order)] <- 0
+final_df$days_w_mask_mandates[is.na(final_df$days_w_mask_mandates)] <- 0
+final_df$COVID_increase_per_capita <- final_df$COVID_increase / final_df$ppl_2018
+final_df$Case_Per_100k_Pop <- final_df$COVID_increase / (final_df$ppl_2018 / 100000)
+final_df$tests_per_pct_pop <- final_df$totalTestResults / final_df$ppl_2018
+final_df <- final_df[!final_df$state == "DC", ]
+```
+
+# Introduction: 
+
+In response to the COVID-19 pandemic, many countries have endeavored to control the spread of COVID-19 by limiting population mobility through enforcing face mask mandates and stay home orders, in order to reduce close contacts.
+
+In the United States, residents changed their mobility pattern dramatically since COVID-19 pandemic started. As shown in the plot below, COVID-19 daily cases spiked during the summer and holiday season from November 2020 to January 2021. The spike in new cases was the result of multiple factors including quarantine fatigue, group activities, and social gatherings in the summer and holiday seasons. Accordingly, mobility change to residential also showed short spikes during the same periods. As the virus continues to spread through October, the population responds to COVID-19 with more precautions and their mobility trend tends to stabilize at the later period. However, during the early months, even though the number of daily increases is comparably lower than the later spikes, the mobility to residential data indicated that the average change to residential increased 10-20% compared to baseline last year. People dramatically reduced their mobility during the beginning of the pandemic even though the cases number were lower, but as the year progressed, mobility began to increase again. Therefore, we are interested in such trends and explored a few other variables to find their effects on the spread of COVID-19.
+
+Our research question is – Is there a causal relationship between mobility and the spread of COVID-19 cases during February 2020 to June 2020 period? Furthermore, what other factors affect such relationships? We hypothesize that face mask mandates and Stay-At-Home orders, which are primary reasons for population's mobility change to residential, also have impacted the spread of COVID-19.
+
+Our research can help build a stronger understanding of the relationship between political interventions and the trend of a pandemic. The outcomes could suggest whether implementation of political orders are effective, and also provide reference for political leaders to take effective measures preventing the spread of futher epidemics.
+
+```{r Introduction plots mobility and COVID cases, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 5, fig.align="center"}
+
+# Introduction - look at daily change to inform the decision of time frame selected
+mob_case_date <- aggregate(Mob_retail_and_recreation ~ date, input_df, mean)
+mob_case_date$grocery <- aggregate(Mob_grocery_and_pharmacy ~ date, input_df, mean)[,2]
+mob_case_date$parks <- aggregate(Mob_parks ~ date, input_df, mean)[,2]
+mob_case_date$transit<- aggregate(Mob_transit_stations ~ date, input_df, mean)[,2]
+mob_case_date$workplaces <- aggregate(Mob_workplaces ~ date, input_df, mean)[,2]
+mob_case_date$residential <- aggregate(Mob_residential ~ date, input_df, mean)[,2]
+
+mob_case_date$COVID_increase_daily <- aggregate(new_case ~ date, input_df, sum)[,2]
+names(mob_case_date)[names(mob_case_date) == 'Mob_retail_and_recreation'] <- 'recreation'
+
+
+p_residential <- ggplot(mob_case_date, aes(x=date, y=residential)) +
+  geom_line(color="red") + 
+  ggtitle("Residential Mobility") +
+  labs(x="Date", y="Avg. Percent Change")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_covid_increase <- ggplot(mob_case_date, aes(x=date, y=COVID_increase_daily)) +
+  geom_line(color="blue") +
+  ggtitle("COVID-19 Daily Increase")+
+  labs(x="Date", y="Num. of Cases")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_residential + p_covid_increase
+```
+# Data Wrangling and Variables
+## Data Sets:
+In order to test our hypothesis, we obtained four data sets and selected a few interesting variables for further analysis. 
+
+1. [United States COVID-19 Cases and Deaths by State](https://data.cdc.gov/Case-Surveillance/United-States-COVID-19-Cases-and-Deaths-by-State-o/9mfq-cb36/data) A database of COVID cases that collected by Center of Disease Control 
+
+2. [COVID-19 US State Policy Database](www.tinyurl.com/statepolicies) A database of state policy responses to the pandemic, compiled by researchers at the Boston University School of Public Health.
+
+3. [COVID-19 Community Mobility Report](https://www.google.com/covid19/mobility/) A Google dataset that includes state-level measurements of individual mobility
+
+4. [The American Community Survey](https://data.census.gov/cedsci/table?q=ACS&g=0100000US.04000.001&tid=ACSDP1Y2019.DP05&moe=false&hidePreview=true)  American Community Survey A data set collected by US Census Bureau in 2018. It contains state-level demographics and other indicators of general interest.
+
+## Variables and transformation:
+The variables that we interested in and transformation details are shown below. Each variable are explored at the state level within the timeframe selected (02/15/2020 - 06/30/2020). A number of demographic variables were explored and evaluated in Model 3 and 4 to further explore our hypothesis. The details of transformation would be included in the model section. 
+
+- State: Abbreviation used for all states in United States. 
+- COVID Cases Per 100K: Accumulated COVID-19 confirmed cases divided by 100k population by state. 
+- Residential Mobility: Average value of all subseted sample's mobility to residential data. 
+- Stay Home Order: Number of days of state-level stay home order being enforced. 
+- Mask Mandates: Number of days of state-level mask mandates being enforced. 
+- Ethnicity Populations: A percentage of a total state’s population by ethnicity group 
+- Population Age: Percentage of the population in each age group at the state-level: 0-34, 34-65, 65+ 
+- Family Households: Percentage of households that are families 
+
+# Exploratory Data Analysis: 
+First, we want to look at how each predictor variable and outcome variable correlate to each other, and their distributions. As shown below, we looked at a scatterplot matrix of the variables of interest, and it showed the correlation between each variable. A few variables are selected as we think they could help explain the spread of COVID-19, including COVID cases per 100K population, face mask mandates duration, stay home order duration, and residential mobility. Looking at the correlation of COVID cases vs each variable, all showed an upward trend. This is contradictory to our hypothesis, as we assume with a longer duration of mask mandates and stay home order, the COVID cases would decrease overtime. Also, with more mobile activity changed to residential and less contact, the COVID cases would decrease as well. This suggests that there are omitted variables and reverse causality interfering with our hypothesis and modeling accuracy, which will be discussed in depth in the model specific limitation section.
+
+```{r Introduction plot 2, Scatterplot of critical variables, echo = FALSE, warning = FALSE, message = FALSE, fig.align="center"}
+final_df %>%
+  select(Case_Per_100k_Pop,
+         days_w_mask_mandates,
+         days_w_stay_home_order,
+         mob_residential_avg) %>%
+  rename("COVID Cases Per 100K " = Case_Per_100k_Pop, 
+         "Residential" = mob_residential_avg, 
+         "Mask Mandates" = days_w_mask_mandates, 
+         "Stay Home Order" = days_w_stay_home_order) %>%
+  drop_na() %>%
+  scatterplotMatrix()
+```
+
+We also looked at the statistics and distribution of the four critical variables. The summary table of statistics informed us that our outcome variable COVID Cases per 100K population in each state has a minimum of 63.92, mean of 686.09, and maximum of 1938.35 within the time frame we were interested in. The distribution plot showed us a relatively normal distribution, which allows us to perform further analysis.
+
+Residential Mobility - According to the summary table, it has a minimum of 6.066, mean of 9.889, and maximum of 15.314. The distribution plot showed a sparse representation of normal distribution with slight right skewness. As described in the Google Mobility Report, each raw data point represented the percentage of mobility change to specific activity compared to the baseline which was documented a similar time period in the previous year. It represents a percentage change of such activity of the sample compared to previous year, which is independent of other mobility variables. This variable helped us to see how much more time residents stayed at home at the beginning of COVID-19 pandemic. 
+
+Mask mandates - Within the timeframe of interest, there were only 18 states having face mask mandate in place. At the early stage of COVID-19 pandemic, the mask was not recommended by health officials to the general population as the nation was facing a shortage of medical supply. This led to a later issued date of official state-level mask mandate. This also caused that many mask mandate issued dates were later than the time period we selected. This explained the high frequency of zero days in the distribution plot above. 
+
+Stay Home order - There were 11 states that have zero days where they enforced a stay at home order. This led to the right skewed distribution. The raw data showed that multiple states had no start or end date of a strict state-level stay-at-home order. Even with such order, businesses tended to follow more or less strict guidelines, which made it difficult to evaluate the effectiveness of this state level order. The implementation of this order was hard to be evaluated in terms of effectiveness of social distancing the population. With this in mind, we further evaluated them in our models. 
+
+We will look at the how three predictor variables affected our outcome variable in Model 1 and 2. Many other demographic predictor variables will be evaluated and discussed in Model 3 and 4 to further test of our hypothesis. 
+\
+\
+\
+
+```{r EDA plots - distribution of cases days with mask mandates and stay home order, echo = FALSE, warning = FALSE, message = FALSE, fig.align="center"}
+layout(matrix(c(1,2,3,4), 2, 2, byrow = TRUE))
+
+# Summary stats of critical variables
+model_1_2 <- final_df %>%
+  select(Case_Per_100k_Pop, mob_residential_avg, days_w_mask_mandates, days_w_stay_home_order) %>%
+  rename("COVID Cases Per 100K " = Case_Per_100k_Pop, 
+         "Residential" = mob_residential_avg, 
+         "Mask Mandates" = days_w_mask_mandates, 
+         "Stay Home Order" = days_w_stay_home_order) %>%
+  summary()
+ model_1_2
+
+# distribution of each variable
+case_dist <- final_df$Case_Per_100k_Pop
+hist(case_dist,
+main="COVID Cases Distribution",
+xlab="Per 100k Population",
+ylab="Frequency")
+
+mob_residential_dist <- final_df$mob_residential_avg
+hist(mob_residential_dist,
+main="Residential Mobility Distribution",
+xlab="Average Change",
+ylab="Frequency")
+
+mask_dist <- final_df$days_w_mask_mandates
+hist(mask_dist,
+main="Mask Mandates Distribution",
+xlab="Days",
+ylab="Frequency")
+
+stay_home_dist <- final_df$days_w_stay_home_order
+hist(stay_home_dist,
+main="Stay Home Order Distribution",
+xlab="Days",
+ylab="Frequency")
+```
+
+# Models
+
+## Model 1
+
+```{r Models_1 - Mobility Plots Designs, echo = FALSE, warning = FALSE, message=FALSE}
+corr_model_variables <- final_df %>% 
+    select(
+         Case_Per_100k_Pop,
+         mob_residential_avg,
+         mob_parks_avg,
+         mob_retail_and_recreation_avg,
+         mob_grocery_and_pharmacys_avg,
+         mob_workplaces_avg,
+         mobs_transit_stations_avg)%>% 
+    drop_na()
+
+colnames(corr_model_variables) <- c("COVID Cases Per 100K ", "Residential Mobility", "Parks Mobility", "Retail Mobility", "Groccery Mobility", "Workplace Mobility", "Transit Mobility")
+
+case_histogram <- final_df %>% 
+  ggplot(aes(x = Case_Per_100k_Pop)) +  
+  geom_histogram(fill='lightblue', binwidth = 300, color='black', alpha=.9) + 
+  labs(title = "COVID Cases Per 100K ", x = "COVID Cases Per 100K" , y = 'Frequency') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+Mobility_scatter <- ggplot(final_df, aes(y=mob_residential_avg, x = Case_Per_100k_Pop)) + 
+  geom_point() + 
+  geom_smooth(method=lm) + 
+  labs(title = "COVID Cases Per 100K  & mobility Scatter Plot" , 
+       x=  "COVID Cases Per 100K", y= "Residential Mobility" )+ 
+  geom_text(aes(label = state), size =3,
+            colour = "blue", vjust = 1.5, 
+            position = position_dodge(.9))
+```
+
+For our base model, we wanted to explore the relationship between cases per 100k population to mobility during the selected period (02/15/2020 to 06/30/2020). One of the key insights between the various mobility variables is that residential variables do inversely correlate with all other mobility variables. As the Google Mobility (Understand the data - Link) describes residential mobility as a residential variable shows a change in duration while the other variables measure a change in total visitors and as moist people already spend a big part of the day at places of residence, the capacity for change is not too large. Additionally, one can see residence as the default state and other locations only trigger once one has left the residence.
+
+Other factors such as weather, availability of public transportation, availability of parks, identification of these locations appropriately would also determine the accuracy of visitor counts. Also, we could identify the reverse causality between ‘residential mobility’ and ‘COVID Cases per 100k population  ’ as during this period there was a significant relay of information around increases in cases counts and spread of COVID. One way to comprehend reverse causality is that significant people were concerned with the spread and would modify the travel behavior when COVID cases were on the rise and relax down once the spread started to slow down.
+
+```{r Models_1 - Mobility Corelations, echo = FALSE, warning = FALSE, message=FALSE}
+CorrPLot_Mobility <- corrplot(cor(corr_model_variables),method = "color",order="original", tl.cex = 0.8, tl.srt=45, 
+                              cl.cex = 0.5, diag=FALSE, addCoef.col = "white", addCoefasPercent = TRUE)
+```
+
+The next step is to identify whether ‘Case per 100k population’ does have normal distribution and plot the cases per 100k population per state as a variable of average residential mobility.
+
+```{r Plots_Model_1 Plot Display, message = FALSE, echo = FALSE, fig.cap='Model 1 - Mobility', fig.pos='!b', warning = FALSE,fig.width = 6, fig.height = 4, fig.align="center"}
+case_histogram 
+
+Mobility_scatter
+```
+As you can see above the mobility and COVID cases have a positive correlation and do display patterns but also expose various outliers such as ‘Hawaii’, ‘Louisiana’ and ‘Montana’ which may have quite skewed plotting of mobility and COVID cases as they may represent the extreme variation.
+
+
+```{r Models_1 - Mobility Sumamry, echo=FALSE, warning = FALSE, message= FALSE, fig.align="center"}
+model_1 <- lm(Case_Per_100k_Pop ~ mob_residential_avg, 
+              data = final_df)
+
+stargazer_Model1 <- stargazer( model_1,
+          column.labels = c("Model 1 - Mobility"),
+          type='text',
+          report = "vc*p",
+          title = "Regression Results - Model 1",
+          covariate.labels = c("Residential Mobility"),
+          digits = 2, digits.extra = 2,
+          dep.var.labels = "COVID Cases Per 100K")
+```
+
+Model one indicates that an increase in COVID cases is dependent on residential mobility. An increase in average residential mobility (people tend to stay home longer) predicted to increase in COVID cases to another 88.62 cases per 100k population with a standard deviation of 352.46. The R^2 for the model is 0.25 and a statistically significant result of less than 0.01.
+
+Interestingly, the negative Y intercept is critical as the all the values are  right top quadrant of the plot and as we are trying to summarize the variable ‘COVID cases per 100k population’ as an aggregate function during the period, we can cannot transform too much as the transforming aggregate functions may have multifold impact and can deviate the model significantly. Intuitively, we are expecting to have higher case counts during this period as most states were struggling with the COVID spread.
+
+To evaluate model one further, we wanted to evaluate the residuals vs. predicted vs. actuals values to identify the areas of further explorations.
+
+```{r Evaluating the Mobility Model 1, echo=FALSE, warning = FALSE, message= FALSE , fig.width = 6, fig.height = 4, fig.align="center"}
+#Add_tag
+
+final_df$model_1_pred = predict(model_1)
+final_df$model_1_resid = resid(model_1)
+
+Model_1_evaluation_1 <- final_df %>%  
+  ggplot(aes(x = final_df$model_1_pred, y = final_df$model_1_resid), color ='deepskyblue') + 
+  geom_point(aes(color = abs(model_1_resid))) +
+  scale_color_continuous(low = "black", high = "red") +
+  guides(color = FALSE, size = FALSE) +  
+  geom_smooth(method=lm) + 
+  labs(title = "Model 1: Prediction & Residuals", x = "Predictions" , y = "Residuals") +
+  geom_text(aes(label = state), size =2.5, 
+            colour = "blue", vjust = 2.5,
+            position = position_dodge(.9)) +
+  annotate("text", x = 500, y= 750, label = "Adjusted R2 = 0.24")
+
+Model_1_evaluation_2 <- final_df %>%  
+  ggplot(aes(x= final_df$model_1_pred, y=final_df$Case_Per_100k_Pop)) + 
+  geom_point() +
+  geom_line(data = final_df, aes(y = model_1_pred), size = .75)+
+  geom_smooth(method=lm) + 
+  labs(x='Predicted Values', y='Actual Values (Cases)', title='Model 1: Predicted vs. Actual Values')+
+  geom_text(aes(label = state), size =2.5, 
+            colour = "blue", vjust = 2.5,
+            position = position_dodge(.9))
+qqnorm(final_df$model_1_resid) 
+qqline(final_df$model_1_resid, col = "blue")
+```
+
+```{r Model 1 Evaluation plots, echo=FALSE, fig.cap='Evaluating Model 1', fig.pos='!b', message=FALSE, warning=FALSE, fig.width = 12, fig.height = 4, fig.align="center"}
+(Model_1_evaluation_1) | (Model_1_evaluation_2)
+```
+As you can notice that some actual values and predicted values do have similar trends but do not explain the behavior of certain states such as ‘Hawaii’ where predicted cases count is much higher than the actual case counts and ‘Arkansas’ where the actual values are much higher than the predicted values. 
+
+One of the interesting things about Prediction vs. residual is that as the predicted values increase the deviation of actual vs. predicted values increases. Hence, one can understand that states with higher actual case values may have other critical factors associated with the increase in COVID spread. But, given the cluster of values around 0 on ‘prediction vs residual’ plots suggests that the linear model can be enhanced further to include other variables that may explain the deviation but this is a decent model, to begin with. Also, based on the Normal QQ plot as well, it suggests that the model is normally distributed as most values are closely following the qq line as expected.
+
+Couple of limitations of this base model is that grouping the mobility for an entire state over 5 months does take variations away from the data and bring the data towards the overall averages.Also, the residential mobility is difficult to reconstruct or summarize as average as the mobility will differ from each county to each day and would have seasonality of weekend, holidays and local trends.
+
+## Model 2:
+
+From the baseline model, we are observing that it is not able to explain most of variance due to a low R2 score. Indeed, many variables can be omitted if only a single variable is used to explain the case number per 100k. In our next step, we want to introduce more variables that are relevant to stopping the spread of COVID-19. Here we are particularly interested in how government policies are affecting the spread of COVID-19. Many states in succession started to place stay stay-at-home and, as a result, US resident mobility was significantly affected by stay-at-home order in the early of year 2020. To measure the effect of government policies, we add the variable to measure duration of stay-at-home order before June 30, 2020. This variable is also a proxy variable to measure how serious a state is treating COVID-19. If the duration is long, it means the state government is serious about COVID and decides to act early to combat its spread. Note that every state might place the order in a different way and we only consider the period when restrict order is placed. Take Texas for example. There was stay-at-home order placed but government did not restrict movement to public places. In this case, we assume the duration of stay-at-home order is zero day for Texas. This variable which affects the case number in the same direction as residential mobility (although due to reverse causality, the coefficient is positive), is omitted in our model 1 and the coefficient of residential mobility is biased away from zero because no government effort is captured to explain the slowdown of COVID case number. Another interesting government policy relevant to mobility is the mask mandate. Even though residents were encouraged to stay at home, essential activities were not forbidden, and people could still be active in public area. However, wearing masks has been proven to be an effective measure to reduce risk of infection when people must meet others in person. Therefore, including mask mandate will help to explain the cases when mobility itself is not enough to make a prediction on the spread of COVID. Here again, we take into account the effect of wearing masks by introducing the duration of mask mandate for each state in our model 2. In the end, we will include 3 variables in total to predict the case number per 100 thousand people in the population from 2020-2-15 to 2020-6-30 at state level: residential mobility, the duration of stay-at-home order, and the duration of mask mandate order.  
+
+```{r Model 2 correlation between variables,  echo = FALSE, warning = FALSE, message = FALSE}
+corr <- final_df %>% 
+    select(Case_Per_100k_Pop,
+         days_w_stay_home_order,
+         days_w_mask_mandates,
+         mob_residential_avg) %>% 
+    drop_na()
+
+colnames(corr) <- c("COVID Cases Per 100K", "Stay Home Order", "Mask Mandates", "Residential Mobility")
+
+corrplot(cor(corr),method = "color",order="original", tl.cex = 0.8, cl.cex = 0.5,tl.srt=45,
+                   diag=FALSE, addCoef.col = "white", addCoefasPercent = TRUE)
+```
+
+To further understand the relationship between the variables, we plot a correlation matrix for them. Among the predictors, we do not see highly correlations, implying that we are less likely to have high multicollinearity issue in our model 2. The predictors all demonstrate some correlation with outcome variable except the duration of stay-at-home order. However, to evaluate the effect of each variable, correlation is not the best way to draw a conclusion. We will fully evaluate them by running OLS model and looking at their statistical significance, magnitude of coefficients and standard error.
+
+
+```{r models_2 - Residential and Mobility,  echo = FALSE, warning = FALSE, message = FALSE}
+model_2 <- lm(Case_Per_100k_Pop ~ mob_residential_avg + days_w_stay_home_order + days_w_mask_mandates, data = final_df)
+
+```
+
+
+```{r Model 1 & 2  Stargazer Output,  echo = FALSE, warning = FALSE, message = FALSE}
+stargazer(model_1, model_2,
+          column.labels = c("Model 1", "Model 2"),
+            type='text',
+          report = "vc*p",
+          covariate.labels = c("Residential Mobility", "Stay Home Order", "Mask Mandates"),
+          dep.var.labels = "COVID Cases Per 100K")
+```
+From the table above, we can see that all key variables show statistical significance but the coefficient of residential mobility has dropped to 77.204 from 88.622, indicating the additional variables have changed the bias in the coefficient for residential mobility. The coefficient for duration of stay-at-home order is -4.602. It confirms that with just one single variable itself, residential mobility has been biased away from zero by the negative sign of coefficient for duration of stay-at-home order. Practically, it indicates if a state could place stay-at-home order one day earlier, there would be about 4 less cases per 100k people in the population during the early of the 2020. Interestingly, the coefficient for duration of mask mandate is positive, which can be possibly the result of the reverse causality between duration of mask mandate and COVID cases. It is likely that the mask mandate is placed because the COVID cases already builds up its number and within the period being studied the effect of mask mandate is not well captured. As a result, the positive sign of duration of mask mandate is a limiting factor to the ability of explanation of model 2.
+
+```{r F-test Model 1&2, echo = FALSE, warning = FALSE, message = FALSE}
+anova(model_2, model_1, test = 'F' )
+```
+Yet we are still interested in comparing model 1 and model 2 and checking the assumptions. Running a F-test, we are able to see model 2 has indeed given more explanatory power than model 1 by reducing the sum of squared residuals. We obtain a statistical significance at 0.001 level, meaning the additional variables produce noticeable effect. 
+
+### Model 2: CLM Assumptions
+Since we are using a relatively small data set of only 50 data points, it is also necessary to check the CLM assumptions to make sure the model is good shape. 
+```{r Model 2Linear Conditional Expectation , echo = FALSE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 3, fig.align="center"}
+# Linear Conditional Expectation
+model2_df <- subset(final_df, select=c(days_w_mask_mandates, days_w_stay_home_order , mob_residential_avg , Case_Per_100k_Pop ))
+model2_df$prediction <- c(predict(model_2, model2_df))
+model2_df$residual <- resid(model_2)
+ggplot(model2_df, aes(x=prediction, y= residual)) + 
+    geom_point(size=2) +
+    geom_smooth(method=lm)
+```
+First of all, we check the assumption of linear conditional expectation by plotting residual vs prediction. We see the residuals are not apparently away from zero, which means the assumption can hold for true and model indeed has captured the linear relationship between variables. Second, when running the model, we observe no variable dropped due to perfect collinearity. In the correlation matrix, we do not have highly correlated predictors either. Therefore, collinearity will not be a concern for us. 
+
+```{r Model 2 Normally Distributed Errors, echo = FALSE, warning = FALSE, message = FALSE}
+qqnorm(model2_df$residual)
+qqline(model2_df$residual, col = "blue", lwd = 2)
+```
+
+Third, we want to make sure the residuals are normally distributed by checking the normal Q-Q plot. From the plot above, the points do not form a perfect a line, meaning the residuals are not perfectly normally distributed. But it is still safe to consider the assumption of normally distributed errors can hold for true.
+\
+\
+
+```{r Model 2 BP Test, echo = TRUE, warning = FALSE, message = FALSE}
+bptest(model_2)
+```
+Fourth, we need to the assumption of homokedastic conditional variance by running the Breusch-Pagan test. The test gives a p-value of 0.7182, which is larger than 0.05. Therefore, we fail to reject the null hypothesis that there is no evidence for heteroskedastic error variance. Meeting this assumption has justified using standard errors in previous results. 
+
+Lastly, IID assumption cannot be met. On the one hand, the data is aggregated at state level but people can travel between states, making each state not independent. On the other hand, 50 states are randomly drawn from a population of infinite number of states. In this sense, it is identically distributed. But still, IID assumption is violated. 
+
+## Model 3:
+
+Model 2 focused on mobility and policy data to explain the increase in COVID, but there are still omitted factors that lead to variations in COVID cases. One of the most significant is how people within each state react to COVID. Demographics including age, occupation, income, ethnicity, culture, household, and health all play a role in how people respond to the virus. The goal of model 3 was to explore these demographic categories at the state level to determine if there were large enough variations between states to provide useful metrics to model on.
+ 
+We began by evaluating age by grouping each state's population into three categories: 0-34, 35-65, and 65+. These categories represent the young, middle age, and elderly population, and each category have distinct differences in how they were affected by COVID. While people 65+ are at a higher risk, it may lead to a more cautious lifestyle with lower mobility and transmission compared to a younger population. Alternatively, a younger population may lead to fewer cases due to less severe symptoms that lead to less transmission. Our hypothesis was that states with a higher percentage of adults 65+ would lead to a higher number of COVID cases due to the spread of COVID in old folks’ homes and other senior care facilities at the beginning of the pandemic.
+
+```{r Correlation between age variables, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 4}
+age_rename <- final_df %>%
+  select(Case_Per_100k_Pop,
+         age_0_34_pct,
+         age_35_65_pct,
+        age_65_greater_pct) %>%
+  rename('Covid Cases per 100k Pop' = Case_Per_100k_Pop,
+        'Pop Age 0-34 (Pct)' = age_0_34_pct,
+        'Pop Age 35-65 (Pct)' = age_35_65_pct,
+        'Pop Age 65+ (Pct)' = age_65_greater_pct)
+
+#par(mfrow=c(1,2))
+#corr_plot <-corrplot(cor(age_rename),method = "color", tl.cex = .8, cl.cex = 0.5,
+ #                  diag=FALSE, addCoef.col = "black", addCoefasPercent = TRUE, tl.col = "black")
+
+corr <- round(cor(age_rename), 2)
+corr_age <- ggcorrplot(corr, hc.order = FALSE, type = "upper",
+   lab = TRUE, colors = c("#E46726", "white", "#6D9EC1")) +
+  theme(axis.text.x=element_text(size=10, angle=45),
+        axis.text.y=element_text(size=10))
+#Age scatter plot
+scatter_age <- ggplot(final_df, aes(y=Case_Per_100k_Pop, x = age_35_65_pct)) + 
+  geom_point() + 
+  geom_smooth(method=lm) + 
+  labs(title = "Covid cases per 100k & Adults 65+") +
+  xlab("Pop Age 65+ (Pct)") +
+  ylab("Covid Cases per 100k Pop")
+
+grid.arrange(corr_age, scatter_age, ncol=2)
+```
+Our analysis showed that our hypothesis was incorrect since our evaluation showed there was not a strong relationship. The correlation plot shows that none of the age groups have a significant R^2’s. The scatter plot graphs the percentage of each states' population against the number of COVID cases to help us understand the weak relationship. Evaluating the graph shows that the majority of states have between 35% and 40% of their population above the age of 65. The small variability in the elderly population between states and the wide range of COVID cases helps explain the weak relationship between the variables. Since we're evaluating at the state level, there is not a distinctive difference between them that explains the increase in COVID cases. In order to effectively utilize age as a metrics we would need to evaluate smaller populations such as the variance between cities.
+
+Next, we evaluated family status and income to determine if states with a larger percentage of family households or lower income households would lead to a higher number of COVID cases. Studies have shown that over half of people living with someone who has COVID ended up contracted the virus themselves. Based on this, our assumption is that state's with higher number of family households will lead to a higher number of COVID cases. In addition, a lower median household income could be an indication that people will be forced to continue working in order to support their family even if it means an additional risk of contracting COVID.
+```{r Income and Family Graphs, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 4}
+#Family scatter plot
+family_scatter <- ggplot(final_df, aes(y=Case_Per_100k_Pop, x = family_households_pct)) + 
+  geom_point() + 
+  geom_smooth(method=lm) + 
+  labs(title = "Covid cases per 100k & Family Households") +
+  xlab("Family Households (Pct)") +
+  ylab("Covid Cases per 100k Pop")
+
+income_scatter <- ggplot(final_df, aes(y=Case_Per_100k_Pop, x = median_income)) + 
+  geom_point() + 
+  geom_smooth(method=lm) + 
+  labs(title = "Covid cases per 100k & Median Income") +
+  xlab("Median Income") +
+  ylab("Covid Cases per 100k Pop")
+
+grid.arrange(family_scatter, income_scatter, ncol=2)
+```
+As with age categories, household demographic data between family and non-family households showed very little variability between states. The plot above shows that for most states family households represent between 62% and 68% of all households. Within states between 62% and 68%, there was a wide range of COVID cases per 100k. The small amount of variability in the percentage of family households between states makes it difficult to interpret its impact on the increase in COVID cases.
+Median household income shows a slightly stronger relationship with COVID but since standard of living and average income vary between states it is difficult to interpret. Evaluating the percentage of a state's population in poverty also lead to similar results. We determined that income was not an ideal metric to explain the increase in COVID cases during the beginning of the pandemic when modeling at the state-level.
+
+The demographic metrics that proved to be the most effective in accurately predicting the number of COVID cases were ethnicity and population density. Previous studies have shown that Black, Hispanic, Native American, and other minority ethnicities were more affected by COVID than white and Asian communities. To capture this impact, we derived a variable representing the percentage of a state’s population that was composed of minority communities at higher risk. The derived metric also provided us a more normal distribution with fewer outliers since certain ethnicities differ between states. In addition, population density also showed a strong correlation to Covid cases after we removed DC as an outlier because of its extremely high population density and a low number of COVID cases.  <br />
+```{r Population Density Graphs, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 4, fig.align="center"}
+minority_scatter <- ggplot(final_df, aes(y=Case_Per_100k_Pop, x = minority_pop_pct_at_risk)) + 
+  geom_point() + 
+  geom_smooth(method=lm) + 
+  labs(title = "Covid cases per 100k & Minority Population") +
+  xlab("Minority Population (Pct)") +
+  ylab("Covid Cases per 100k Pop") +
+  geom_text(aes(label = state), size =2.5, 
+            colour = "blue", vjust = 2.5)
+
+
+#Age scatter plot
+density_scatter <- ggplot(final_df, aes(y=Case_Per_100k_Pop, x = ppl_density)) + 
+  geom_point() + 
+  geom_smooth(method=lm) + 
+  labs(title = "Covid cases per 100k & Population Density") +
+  xlab("Population Density") +
+  ylab("Covid Cases per 100k Pop") + 
+    geom_text(aes(label = state), size =2.5, 
+            colour = "blue", vjust = 2.5,
+            position = position_dodge(.9))
+
+grid.arrange(minority_scatter, density_scatter, ncol=2)
+#minority_scatter
+```
+
+The plots above evaluates the breakdown among states for both the percentage of a state's population from an ethnicity at a higher risk of COVID and population density. Minority Population follows a more normal distribution between 0 and 50% of the population and does show a trend between the increase in population and COVID cases. 
+While there is a lot of variability with states that have a density of 0-250 people per square mile, a clear trend is defined as population density increases. The results also show that states in the Northeastern united states including New Jersey, Rhode Island, Massachusetts, and Connecticut all have the highest population density and COVID rates per 100k population. This could be because they are all smaller states with higher density or because of their geographic proximity increasing the spread of COVID.
+
+```{r, Correlation between ethnicity variables, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 4, fig.align="center"}
+final_df_rename <- final_df %>%
+  select(Case_Per_100k_Pop,
+        days_w_stay_home_order,
+        days_w_mask_mandates,
+        mob_residential_avg,
+        white_pop_pct,
+        asian_pop_pct,
+        minority_pop_pct_at_risk,
+        ppl_density) %>%
+  rename('COVID Cases Per 100K' = Case_Per_100k_Pop,
+        'Stay Home Order' = days_w_stay_home_order,
+        'Mask Mandates' = days_w_mask_mandates,
+        'Residential Mobility' = mob_residential_avg,
+        'Minority Population' = minority_pop_pct_at_risk,
+        'Population Density' = ppl_density)
+      
+
+corr <- final_df_rename %>% 
+    select(
+        'COVID Cases Per 100K',
+        'Stay Home Order',
+        'Mask Mandates',
+        'Residential Mobility',
+        'Minority Population',
+        'Population Density'
+          ) %>% 
+    drop_na()
+corrplot(cor(corr),method = "color", tl.cex = .8, cl.cex = 0.5,
+                   diag=FALSE, addCoef.col = "black", addCoefasPercent = TRUE, tl.col = "black")
+```
+Our correlation results support the previous plot and show that minority populations had a .46 R^2 compared to a -.26 R^2 for white population percentage. Minority populations could be affected for a variety of reasons including cultural differences such as multigenerational households or other reasons including status of living and occupation. While ethnicity can't be used as the sole cause of an increase in COVID, there is a clear trend between the two and can be used to explain the increase in cases which was not completely explained by mobility and policy metrics.
+
+Population density has the highest R^2 of .76 which makes it the strongest metric we have evaluated so far. While our original hypothesis was that population density would correlate strongly with minority communities, the results do not support it. In reality, population density correlates strongest with mask mandates and residential mobility. The relationship may be because higher density states and cities are more likely to implement mask mandates early in the pandemic comapred to rural areas. Even though population density has a strong correlation, its distribution is heavily skewed towards lower density states between 0-250. The high correlation to mask mandate and residential mobility could also lead to problems with collinearity when modeling. As a result, we have to be aware of these limitations when using the metric in the model. <br />
+
+Based on our findings, we built model 3 using the derived minority population metric:
+Case_Per_100k_Pop ~ mob_residential_avg + days_w_mask_mandates + days_w_stay_home_order + minority_pop_pct_at_risk
+\
+\
+\
+\
+\
+```{r, Model 3 Ethnicity, echo = FALSE, warning = FALSE, message = FALSE}
+model_3 <- lm(Case_Per_100k_Pop ~  mob_residential_avg +
+                                          days_w_mask_mandates +
+                                          days_w_stay_home_order + 
+                                          #black_pop_pct + 
+                                          #hispanic_pop_pct +
+                                          #asian_pop_pct +
+                                          minority_pop_pct_at_risk
+                                          ,data = final_df)
+#coeftest(model_3, vcov = vcovHC)
+#summary(model_3)
+stargazer( model_2, model_3,
+          column.labels = c("Model 2", "Model 3"),
+            type='text',
+          report = "vc*p",
+          #omit.stat=c("f"),
+          covariate.labels = c("Residential Mobility", "Stay Home Order","Minority Population", "Mask Mandates"),
+          dep.var.labels = "COVID Cases Per 100K"
+          )
+```
+After modeling, we compare the results to model 2 in the table to identify the impact of adding the minority population metric. The results show that Minority Population has a positive coefficient of 977 which confirms our hypothesis that having a higher percentage of at risk minority groups does lead to a higher number of COVID cases. For every 1% increase in population of a state’s at-risk minority group, the predicted number of COVID cases per 100k increases by 9.72. Overall, the other metrics also retain their statistical significance with only Residential Mobility showing a significant change in its coefficient from 77 to 59. Like with model 2, this indicates that adding the additional metric changes the bias in the coefficient for residential mobility. This could be because the ethnicity metric is capturing another aspect of the spread of COVID that is not impacted by residential mobility. Compared to model 2, the third model captures a new characteristic of each state to better explain how COVID spreads. While ethnicity cannot be used as the only demographic reason to define the increased spread of COVID, it can help explain differences in spread between states with similar policies and mobility statistics. Additional research will have to be conducted to determine how communities with a high percentage of Black, Hispanic, and Native American residents differ and contribute to the increase of COVID cases.
+
+```{r Model 3 F-Test, echo = FALSE, warning = FALSE, message = FALSE}
+anova(model_3,model_2, test = 'F')
+```
+Running an F-test between models 2 and 3 confirms that including ethnicity as a metric increases explanatory power. With a p-value of .006, we are confident that the results are statistically significant and adding the additional variable provides noticeable effect. By adding new metrics we continue to reduce the sum of squares residuals and improve upon our original model.
+
+### Model 3: CLM Assumptions
+As with model 2, we further assess the model to ensure the CLM assumptions are met.
+```{r Model 3 residual graph, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 4, fig.align="center"}
+model_3_df <- subset(final_df, select=c(Case_Per_100k_Pop,
+                                      mob_residential_avg,
+                                      days_w_mask_mandates,
+                                      days_w_stay_home_order,
+                                      minority_pop_pct_at_risk
+                                      ))
+
+model_3_df$prediction <- c(predict(model_3, model_3_df))
+model_3_df$residual <- resid(model_3)
+ggplot(model_3_df, aes(x=prediction, y= residual)) +
+    geom_point(size=2) +
+    geom_smooth(method=lm) +
+    ggtitle('Model 3: Prediction vs Residual')
+```
+First, we check the linear conditional expectation by plotting the residuals and predictions in the chart above. The results show that the residuals are not skewed away from 0. Second, our initial correlation matrix confirmed there is no perfect collinearity between the percentage of minority populations and previous metrics.
+
+We evaluate the third condition of normally distributed residuals by plotting a normal Q-Q plot and running a Wilks-Shapiro test
+
+```{r Normal qq-plot model 3, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 4, fig.align="center"}
+qqnorm(model_3_df$residual)
+qqline(model_3_df$residual, col = "blue", lwd = 2)
+```
+```{r Model 3 qq-plot and Wilk Shaprio Test, echo = FALSE, warning = FALSE, message = FALSE}
+shapiro.test(model_3$residuals)
+```
+The plot above shows that the metrics are not perfectly normally distributed but are close enough where we can assume it holds true. Running a Shaprio-Wilk normality test also shows a high p-value of .49 which confirms we can treat the residuals as normal.
+
+
+Fourth, we run a Breush-Pagen test again to confirm we meet the assumption of homoskedastic conditional variance.
+```{r Model 3 BP Test}
+bptest(model_3)
+```
+The test gives a p-value of .1051, which is larger than 0.05. Therefore, we fail to reject the null hypothesis that there is no evidence for heteroskedastic error variance. Meeting this assumption has justified using standard errors in previous results. 
+
+Finally, we still cannot meet the IID assumption. Since we are still evaluating between states that people can travel between the data is not IID. Since the states with the highest number of COVID cases are all from the Northeast there are serious concerns with it affecting our model. We tried to capture the geographic nature of each state by using one-hot encoding to create metrics representing the US regions defined by the US Census, but were unsuccessful in creating statistically significant metrics. Using only 5 regions is still too broad and further dividing the data into sub-regions complicates the data and the model.
+
+## Model 4:
+
+After running model 3 and determining that adding minority population to the model improves its ability to predict COVID cases per 100k population, we continued to explore how demographic metrics can continue to improve accuracy. The goal of adding new data was to discover the underlying causes of different ethnicities that can lead to an increased number of COVID cases. As shown previously, after removing the outlying variable of DC since it has an extremely high population density, the metric showed a strong relationship to the number of COVID cases. Our hypothesis is that at the start of the pandemic, COVID first spread among large cities and dense populations. Using population density which represents the number of people per square mile, we can better explain how COVID spreads. Areas with high residential mobility but low population density will have different results than more populous states. Since the metric population density has high collinarity with mask mandates and residential mobility, there is a concern that the model will break CLM assumptions.
+
+```{r Model 4 Urban vs Rural and Pop Density, echo = FALSE, warning = FALSE, message = FALSE}
+model_4 <- lm(Case_Per_100k_Pop ~ mob_residential_avg +
+                                    days_w_mask_mandates +
+                                    days_w_stay_home_order + 
+                                    minority_pop_pct_at_risk +
+                                    ppl_density
+                                    #Region_Northeast
+                                    #Pop_Urban_pct
+                                    , data = final_df)
+
+#coeftest(model_4, vcov = vcovHC)
+#summary(model_4)
+
+stargazer( model_3, model_4,
+          column.labels = c("Model 3", "Model 4"),
+            type='text',
+          report = "vc*p",
+          #omit.stat=c("f"),
+          out = "model_3.html",
+          covariate.labels = c("Residential Mobility", "Mask Mandates", "Stay Home Order","Minority Population", "Population Density" ),
+          dep.var.labels = "COVID Cases Per 100K"
+          )
+
+```
+The results of model 4, that includes the new metric population density, show a mix of statistical significance. Overall while the length of stay at home, percent of minority population, and population density all show statistical significance, but the model no longer shows significance for mobility and mask mandates. Our original concerns of perfect collinarity appear to be valid and reduce the significance of our residential mobility metric. Instead of explaining the underlying causes for higher rates of Covid for minority communities, population density has a stronger relationship with mobility and mask mandates. The results could be the cause of states with denser populations implementing mask mandates sooner due to increased risk of Covid transmission. Overall population density does not help us determine the cause of increased Covid cases with states with high minority populations. We may need to explore beyond demographic into more cultural or health aspects to correctly identify the reason and give a causal explanation.
+
+```{r Model4 F-Test, echo = FALSE, warning = FALSE, message = FALSE,fig.width = 12, fig.height = 4, fig.align="center"}
+vif_values <- vif(model_4)
+
+
+par(mfrow = c(1,2))
+barplot(vif_values, main = "VIF Values", horiz = TRUE, col = "steelblue")
+hist(final_df$ppl_density,xlab = "Population Density",col = "steelblue", breaks = 25, main = "Histogram of Population Density")
+
+```
+Running a Variance Inflation Factor test shows that there is potential concern for multicollinearity since Residential Mobility is approaching 3, but it is not considered severe. Another issue is the non-normal distribution of the Population Density metric. Even after removing the extreme outlier of NJ still returns a skewed distribution. Overall, model 4 reduces the impact of our key metrics and is not an improvement compared to model 3. We would need to explore new variables or transform Population Density and remove outliers in order to build a more accurate model. 
+
+## Limitations of Models
+
+
+Google Mobility Data - Mobility data, to a certain extent, represents a certain population who has a Google account and allows Google to use their data for other purposes. Grouping the mobility for an entire state over 5 months does take variations away from the data and bring the overall variable towards the overall averages. During our exploration phase, we identified the certain the state did spike in visits during March 2020 as the weather started to improve and celebrate the start of spring.
+
+Demographic Data - Evaluating demographic data at the state level captures a large population of a state even if only a small part of the population has been affected by Covid-19 during the initial months of the pandemic. Many demographic metrics evaluated did not show a significant causal effect.
+
+Summarization of models using variables such as age, income, population density and ethnicity does take details away from the data and pushes the entire data set to similar averages. For example, the average income for a family of 4 in California 2018 is around 71k but similar average income in San Francisco 2018 was 110k while Alameda County is 54k this variation would be critical to identify the impact of income in a model.
+
+Mask Mandate - As COVID was spreading through the country, we are all aware of the debates around executing the mask mandate and the severity of the enforcement may differ across the state. But, the current data set does provide the start and end date of the mask mandate.
+
+Median Income - Income metrics do not account for cost of living differences between and within states. Difficult to determine lower income communities with a single metric.
+
+Reverse Causality - We could identify the reverse causality between Mobility and COVID spread as the increase in cases do warrant folks to stay indoors and as the spread of COVID slows down people tend to travel more. But, similar to other reverse causality in the other variables.
+
+## Omitted Variables - The following are relevant variables that were not a part of our dataset.
+  
+  - Number of COVID tests - Since testing varied by state at the start of the pandemic, COVID cases could be inflated or under reported depending on the number of tests conducted.
+  
+  - Health metrics - Additional metrics such as obesity rates and other health related metrics could be more useful in describing a population compared to ethnicity or other demographic metrics.
+  
+  - Tourist and Travel metrics - Travel metrics such as number of flights or hotels booked could be useful to define the increased spread of COVID especially during the first months of the pandemic.
+  
+  - Housing Metrics - Additional metrics such as percentage of people living in apartments, single family homes, or public housing could better explain the relationship to COVID cases than family households.
+  
+  - Elderly Care Facilities - Since Nursing homes were hardest hit at the beginning of the pandemic, having a metric to define the total number of people living in elderly care facilities could be more useful than age categories.
+
+# Conclusion 
+
+We started with a casual question around the relationship between mobility and COVID spread. The casual nature of the question did provide us multiple avenues to explore other factors that may provide insight into the modeling COVID spread in the US. 
+
+During the exploration, we did identify these various features that would provide additional refinement and can be encapsulated within these four models that predicted COVID spread using statistically significant variables such as population density, mask mandate, state home order duration, minority population, and residential mobility. Of all the four models, model four does have the highest r squared values but we prefer model three as model four does have issues with collinearity.
+
+But adding the variable ‘minority population at risk’ in model three does stabilize other variables & we are confident that the results are statistically significant and increase explanatory power. But, we can identify that adding singular ethnic groups (Asian, Hispanic, Black, or White) to model three may not be correct as being a member of a certain minority group does make an individual more likely to get COVID nor does a state with a higher population to a specific minority will put more people at risk. Ethnicity does capture some of our omitted variable characteristics such a culture, food habits, genetic predispositions, susceptibility to colder weathers, etc. hence grouping the minority groups into variable does help our model.
+
+Overall, our model accurately describes the impact of mobility, policy, and certain demographic characteristics on the impact of COVID cases at the start of the pandemic. The next steps to continue to improve our model will be to research and implement metrics from new datasets to help handle and explain the omitted-variable bias.
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+ 
+```{r Model 4 Conclusion , echo = FALSE, warning = FALSE, message = FALSE,fig.width = 12, fig.align="center"}
+stargazer(model_2, model_3,model_4,
+          column.labels = c("Model 2-StayHome/Mask", "Model 3-Ethnicity", "Model 4-Minority"),
+            type='text',
+          report = "vc*p",
+          title = "Regression Comparisons",
+          covariate.labels = c("Residential Mob" ,"Stay Home","Minority Pop", "Population Density", "Mask Mandate"),
+          out = "model_conclusion.html",
+          digits = 2, digits.extra = 2,no.space = TRUE,
+          dep.var.labels = "COVID Cases Per 100K", single.row = TRUE, column.sep.width = "0pt", font.size = "small",header=FALSE)
+```
+
+
+
+### End of Lab 2 - Team Flu-Fighter
+
+
