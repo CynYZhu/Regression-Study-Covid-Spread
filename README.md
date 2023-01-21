@@ -1,4 +1,4 @@
-# Regression to Study the spread of COVID-19
+# Regression to Study the Spread of COVID-19
 Date: December 2020
 
 In response to the COVID-19 pandemic, many countries have endeavored to control the spread of COVID-19
